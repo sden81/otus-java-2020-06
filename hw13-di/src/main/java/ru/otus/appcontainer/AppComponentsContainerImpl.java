@@ -1,20 +1,17 @@
 package ru.otus.appcontainer;
 
-import org.reflections.Reflections;
-import org.reflections.scanners.SubTypesScanner;
 import ru.otus.appcontainer.api.AppComponent;
 import ru.otus.appcontainer.api.AppComponentsContainer;
 import ru.otus.appcontainer.api.AppComponentsContainerConfig;
 
 import java.lang.reflect.Method;
 import java.util.*;
+import java.util.stream.Collectors;
 
 public class AppComponentsContainerImpl implements AppComponentsContainer {
 
     private final List<Object> appComponents = new ArrayList<>();
     private final Map<String, Object> appComponentsByName = new HashMap<>();
-    private final String orderNameSeparator = "&&&&";
-    private Object configInstance;
 
     public AppComponentsContainerImpl(Class<?> initialConfigClass) {
         processConfig(initialConfigClass);
@@ -22,39 +19,48 @@ public class AppComponentsContainerImpl implements AppComponentsContainer {
 
     private void processConfig(Class<?> configClass) {
         checkConfigClass(configClass);
+
+        var methods = getConfigMethods(configClass);
+        createBeans(methods);
+    }
+
+    private Object createConfigInstance(Class<?> configClass) {
         try {
-            configInstance = configClass.getDeclaredConstructors()[0].newInstance();
+            return configClass.getDeclaredConstructors()[0].newInstance();
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+    }
 
-        Method[] methods = configClass.getDeclaredMethods();
-        if (methods == null || methods.length == 0) {
+    private List<Method> getConfigMethods(Class<?> configClass) {
+        var methods = Arrays.stream(configClass.getDeclaredMethods())
+                .filter(method -> method.isAnnotationPresent(AppComponent.class))
+                .collect(Collectors.toList());
+        if (methods.isEmpty()) {
             throw new IllegalArgumentException("Empty config class");
         }
 
-        var methodsMap = createMethodsMap(methods);
-        createBeans(methodsMap);
-    }
+        methods.sort((first, second) -> {
+            var firstOrder = first.getAnnotation(AppComponent.class).order();
+            var secondOrder = second.getAnnotation(AppComponent.class).order();
 
-    private Map<String, Method> createMethodsMap(Method[] methods) {
-        Map<String, Method> methodsMap = new TreeMap<>();
-        Arrays.stream(methods).forEach(method -> {
-            if (!method.isAnnotationPresent(AppComponent.class)) {
-                return;
+            if (secondOrder - firstOrder > 0) {
+                return -1;
             }
 
-            var order = method.getAnnotation(AppComponent.class).order();
-            var name = method.getAnnotation(AppComponent.class).name();
-            methodsMap.put(order + orderNameSeparator + name, method);
+            if (secondOrder - firstOrder < 0) {
+                return 1;
+            }
+
+            return 0;
         });
 
-        return methodsMap;
+        return methods;
     }
 
-    private void createBeans(Map<String, Method> methodsMap) {
-        methodsMap.forEach((orderName, method) -> {
-            String name = orderName.split(orderNameSeparator)[1];
+    private void createBeans(List<Method> methods) {
+        methods.forEach(method -> {
+            var name = method.getDeclaredAnnotation(AppComponent.class).name();
             var bean = createBean(method);
             appComponents.add(bean);
             appComponentsByName.put(name, bean);
@@ -63,25 +69,16 @@ public class AppComponentsContainerImpl implements AppComponentsContainer {
 
     private Object createBean(Method method) {
         method.setAccessible(true);
-        var constructorParameterTypes = method.getGenericParameterTypes();
+        var constructorParameterTypes = method.getParameterTypes();
+        var configInstance = createConfigInstance(method.getDeclaringClass());
 
         try {
-            if (constructorParameterTypes.length == 0) {
-                return method.invoke(configInstance);
-            }
-
-            var paramsArray = Arrays.stream(constructorParameterTypes).map(item -> getAppComponent(getClassByName(item.getTypeName()))).toArray();
+            var paramsArray = Arrays.stream(constructorParameterTypes)
+                    .map(this::getAppComponent)
+                    .toArray();
 
             return method.invoke(configInstance, paramsArray);
         } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private Class<?> getClassByName(String className) {
-        try {
-            return Class.forName(className);
-        } catch (ClassNotFoundException e) {
             throw new RuntimeException(e);
         }
     }
@@ -94,15 +91,20 @@ public class AppComponentsContainerImpl implements AppComponentsContainer {
 
     @Override
     public <C> C getAppComponent(Class<C> componentClass) {
-        var bean = appComponents.stream().filter(componentClass::isInstance).findFirst().orElseThrow();
+        var bean = appComponents.stream()
+                .filter(componentClass::isInstance)
+                .findFirst()
+                .orElseThrow(() -> new AppComponentsContainerException(String.format("Bean by class %s not exist", componentClass.toGenericString())));
 
         return (C) bean;
     }
 
     @Override
     public <C> C getAppComponent(String componentName) {
-        var returnEntry = appComponentsByName.entrySet().stream().filter(entry -> componentName.equals(entry.getKey())).findFirst().orElseThrow();
+        if (!appComponentsByName.containsKey(componentName)) {
+            throw new AppComponentsContainerException(String.format("Bean by name %s not exist", componentName));
+        }
 
-        return (C) returnEntry.getValue();
+        return (C) appComponentsByName.get(componentName);
     }
 }
